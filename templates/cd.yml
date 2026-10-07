@@ -1,0 +1,32 @@
+# CD for this repository: after CI succeeds for a push to the default branch, deploy the Coolify applications listed below, in this order.
+# Written by the seed-plugins `cd_setup.py` tool, which fills in the __PLACEHOLDERS__; the token lives in the repository secret COOLIFY_TOKEN.
+# To switch CD off: delete this file (and `gh secret delete COOLIFY_TOKEN`).
+name: CD
+
+on:
+  workflow_run:
+    workflows: [__CI_NAME__]
+    types: [completed]
+    branches: [__BRANCH__]
+
+# Never two deployments of this repository at once, and never cancel one half-way: a newer run waits its turn.
+concurrency:
+  group: cd-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  cd:
+    # Only a SUCCESSFUL CI run of a PUSH to the default branch. A pull request, including one from a fork, can never start this job.
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    uses: blessandsoul/ci-workflows/.github/workflows/cd.yml@v1
+    with:
+      coolify-url: __COOLIFY_URL__
+      apps: '__APPS__'
+      branch: __BRANCH__
+      # The commit CI tested. Coolify deploys the latest commit of the branch, so the deploy step refuses to run if the branch has moved on.
+      expected-sha: ${{ github.event.workflow_run.head_sha }}
+    secrets:
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}

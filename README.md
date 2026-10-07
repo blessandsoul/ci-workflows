@@ -43,6 +43,19 @@ CI by itself only reports. It blocks nothing unless a pull request needs a green
 
 Each run's summary page carries a "CI plan" (what ran and why), and a failed drift check lists the changed columns and tables there (`prisma migrate diff` exit code 2 is drift; any other failure is reported as the command failing, not as drift). The audit job lists each app's vulnerability count. `gh run view --log-failed` shows only "UNKNOWN STEP" for the jobs of a reusable workflow; read the job log through `gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs`, or use `ci_run.py` from the seed-plugins toolkit, which does that and prints just the failing steps.
 
+## CD: deploy to Coolify after green CI
+
+`templates/cd.yml` is a second small caller, written into a project by the seed-plugins `cd_setup.py` tool (a reviewed, confirmed step; never automatic). It runs when the project's **CI workflow succeeds for a push to the default branch** and calls the reusable `cd.yml`, which deploys the project's Coolify applications:
+
+- **Only the commit CI tested.** Coolify deploys the latest commit of the branch, not a given one. If the branch has moved on since CI went green, the run deploys nothing and says so; the newer commit gets its own CI and CD run. If GitHub cannot say what the head is, nothing is deployed.
+- **In order, to the end.** Apps are deployed one after the other in the order given (server before client); each deployment is followed until it is finished, failed, cancelled or timed out. The first failure stops the run and later apps are not touched. An app that already has a deployment queued or running is waited for, so two builds of one app never overlap. One CD run per repository at a time (`concurrency`, never cancelled half-way).
+- **A finished build is not a working site.** The app's https domains are probed (health path or `/`) and must answer 2xx/3xx.
+- **The token.** A Coolify API token with the `deploy` and `read` abilities only, in the repository secret `COOLIFY_TOKEN`. It is only sent to an `https://` Coolify URL, redirects are refused, it is never printed, and the workflow checks out no project code, so a pull request cannot get anything run with it. Fork pull requests cannot start the job at all.
+- **No automatic rollback.** A failure ends with the failing app and which apps were not deployed. To go back, revert the commit on the default branch (CI then CD run again) or redeploy from Coolify.
+- **Dry run.** The `dry-run` input reads, checks idleness and probes but never starts a deployment; the logic and its tests are in `.github/actions/coolify-deploy/` (`npm test` runs them against a fake Coolify).
+
+GitHub cannot see a server's memory, so whether a server can take a build is checked when CD is set up (the toolkit's deploy-readiness verdict), not on every run.
+
 ## How a run decides (so the logs are never a mystery)
 
 `detect` compares the pushed range (or the pull request range) to find changed files. If it cannot (first push, force-push over a missing commit, manual run) it assumes everything changed, which only ever runs more, never less. The decision and its reasons are on the run's summary page under "CI plan".

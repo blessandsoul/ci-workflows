@@ -1,0 +1,61 @@
+# Shared CD: deploys a project's Coolify applications after its CI has passed. A project calls this from a small `cd.yml` (templates/cd.yml) that the
+# seed-plugins `cd_setup.py` tool writes; nothing here is project-specific.
+#
+# What it guarantees (the logic and its tests live in .github/actions/coolify-deploy/deploy.mjs):
+#   * it only ever deploys the commit that CI tested, and does nothing if the branch has moved on;
+#   * apps are deployed in the order given, each deployment is followed to its end, the first failure stops the run;
+#   * the site is probed after a finished build; the Coolify token is only sent to the https URL and never printed.
+# It does not check out project code, so a pull request can never get its code run with the token.
+#
+# The composite action is referenced at @v1 because a reusable workflow cannot refer to "the same ref as me"; releasing a change means moving the
+# v1 tag, exactly as for ci.yml (see the README).
+
+name: CD (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      coolify-url:
+        description: The https:// address of the Coolify instance.
+        type: string
+        required: true
+      apps:
+        description: 'JSON array of {"uuid","name"} objects in deploy order.'
+        type: string
+        required: true
+      expected-sha:
+        description: The commit CI tested.
+        type: string
+        required: true
+      branch:
+        description: The branch Coolify deploys.
+        type: string
+        required: true
+      dry-run:
+        description: Read, check and probe but never start a deployment.
+        type: boolean
+        default: false
+    secrets:
+      COOLIFY_TOKEN:
+        description: A Coolify API token with the deploy and read abilities only.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-24.04
+    # A Next.js build on a loaded server can take 10+ minutes per app; the script has its own per-deployment timeout.
+    timeout-minutes: 45
+    steps:
+      - uses: blessandsoul/ci-workflows/.github/actions/coolify-deploy@v1
+        with:
+          coolify-url: ${{ inputs.coolify-url }}
+          coolify-token: ${{ secrets.COOLIFY_TOKEN }}
+          apps: ${{ inputs.apps }}
+          expected-sha: ${{ inputs.expected-sha }}
+          branch: ${{ inputs.branch }}
+          repository: ${{ github.repository }}
+          dry-run: ${{ inputs.dry-run }}

@@ -1,0 +1,41 @@
+name: coolify-deploy
+description: Deploys Coolify applications in order, follows each deployment to its end and probes the site (see deploy.mjs for the rules). Needs only the Node every GitHub runner has.
+
+inputs:
+  coolify-url:
+    description: The https:// address of the Coolify instance. Anything else is refused, the token would travel in clear text.
+    required: true
+  coolify-token:
+    description: A Coolify API token with the deploy and read abilities ONLY (pass it from a secret).
+    required: true
+  apps:
+    description: 'JSON array of {"uuid","name"} objects, in the order they must be deployed (server before client).'
+    required: true
+  expected-sha:
+    description: The commit CI tested. Nothing is deployed if the branch has moved on from it.
+    required: true
+  branch:
+    description: The branch Coolify deploys.
+    required: true
+  repository:
+    description: owner/name of the repository whose branch head is checked.
+    required: true
+  dry-run:
+    description: 'true = read, check and probe but never start a deployment (used to verify the setup).'
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Everything reaches the script through env, never by interpolating into the command line.
+      env:
+        COOLIFY_URL: ${{ inputs.coolify-url }}
+        COOLIFY_TOKEN: ${{ inputs.coolify-token }}
+        APPS: ${{ inputs.apps }}
+        EXPECTED_SHA: ${{ inputs.expected-sha }}
+        BRANCH: ${{ inputs.branch }}
+        GITHUB_REPOSITORY: ${{ inputs.repository }}
+        GITHUB_TOKEN: ${{ github.token }}
+        DRY_RUN: ${{ inputs.dry-run == 'true' && '1' || '0' }}
+      run: node "$GITHUB_ACTION_PATH/deploy.mjs"
