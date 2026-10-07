@@ -1,0 +1,27 @@
+# CI for this repository. The checks live in blessandsoul/ci-workflows (one place, so an improvement reaches every project at once).
+# Nothing to configure: it detects what this repo has. The options are at the bottom.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same branch cancels the older run, so runs do not pile up and cost minutes on private repositories.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: blessandsoul/ci-workflows/.github/workflows/ci.yml@v1
+    # with:
+    #   skip: "test"          # any of: typecheck, lint, test, build, migrations, docker, audit, secrets
+    #   node-version: "22"    # default: from .nvmrc, package.json engines or the Dockerfile
+    #   docker: always        # auto (only when image inputs change) | always | never
+    #   migrations: always    # auto | always | never

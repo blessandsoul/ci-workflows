@@ -1,0 +1,283 @@
+# Shared CI for the create-tigra style repositories. A project calls this with the ~15-line templates/ci.yml and needs no other configuration.
+#
+#   detect      decides what applies (see .github/actions/detect/detect.mjs) and publishes the plan on the run summary
+#   checks      per app: install, typecheck, lint, test, build (all four always run, so one run shows every failure)
+#   migrations  Prisma migrations against a throwaway MySQL 8.4, then a drift check (only when prisma/ changed, or on a default-branch push)
+#   docker      builds each Dockerfile, starts DB-free images and probes them (only when image inputs changed, or on a default-branch push)
+#   audit       npm audit for production dependencies (advisory)
+#   secrets     gitleaks over the pushed commits (fails on a finding, values redacted)
+#   CI          the one job that summarises everything; require THIS one in branch protection
+#
+# Releases: the composite action below is referenced at @v1 because a reusable workflow cannot refer to "the same ref as me". Moving the v1 tag
+# releases a change to every caller at once; see the README.
+
+name: CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Force a Node version. Empty means auto-detect.
+        type: string
+        default: ''
+      skip:
+        description: 'Comma-separated checks to turn off: typecheck, lint, test, build, migrations, docker, audit, secrets.'
+        type: string
+        default: ''
+      docker:
+        description: auto, always or never.
+        type: string
+        default: auto
+      migrations:
+        description: auto, always or never.
+        type: string
+        default: auto
+
+permissions:
+  contents: read
+
+env:
+  CI: 'true'
+  NEXT_TELEMETRY_DISABLED: '1'
+  # Prisma and some config files read DATABASE_URL while only generating a client or compiling; no connection is made in those steps.
+  DATABASE_URL: mysql://ci:ci@127.0.0.1:3306/ci
+
+jobs:
+  detect:
+    name: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      has_apps: ${{ steps.plan.outputs.has_apps }}
+      apps: ${{ steps.plan.outputs.apps }}
+      node: ${{ steps.plan.outputs.node }}
+      run_migrations: ${{ steps.plan.outputs.run_migrations }}
+      prisma_dir: ${{ steps.plan.outputs.prisma_dir }}
+      run_docker: ${{ steps.plan.outputs.run_docker }}
+      dockerfiles: ${{ steps.plan.outputs.dockerfiles }}
+      run_audit: ${{ steps.plan.outputs.run_audit }}
+      run_secrets: ${{ steps.plan.outputs.run_secrets }}
+      secrets_range: ${{ steps.plan.outputs.secrets_range }}
+      error_count: ${{ steps.plan.outputs.error_count }}
+    steps:
+      # Full history: the detector diffs the pushed range, and a shallow clone would make every run look like "everything changed".
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: plan
+        uses: blessandsoul/ci-workflows/.github/actions/detect@v1
+        with:
+          node-version: ${{ inputs.node-version }}
+          skip: ${{ inputs.skip }}
+          docker: ${{ inputs.docker }}
+          migrations: ${{ inputs.migrations }}
+
+  checks:
+    name: checks (${{ matrix.name }})
+    needs: detect
+    if: needs.detect.outputs.has_apps == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.apps) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.detect.outputs.node }}
+          # The npm cache needs a lockfile; without one setup-node would fail the whole job.
+          cache: ${{ matrix.lockfile && 'npm' || '' }}
+          cache-dependency-path: ${{ matrix.dir }}/package-lock.json
+      - id: install
+        name: install
+        env:
+          LOCKFILE: ${{ matrix.lockfile }}
+        run: |
+          if [ "$LOCKFILE" = "true" ]; then npm ci; else npm install; fi
+      # A Prisma client must exist before TypeScript can compile code that imports it; many projects only generate it in a build script.
+      - name: prisma generate
+        if: ${{ steps.install.outcome == 'success' && matrix.prisma }}
+        run: npx prisma generate
+      # The four checks use !cancelled() so a typecheck failure does not hide a lint or test failure: one run, the whole picture.
+      - name: typecheck
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.typecheck != '' }}
+        env:
+          SCRIPT: ${{ matrix.typecheck }}
+        run: npm run "$SCRIPT"
+      - name: lint
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.lint != '' }}
+        env:
+          SCRIPT: ${{ matrix.lint }}
+        run: npm run "$SCRIPT"
+      - name: test
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.test != '' }}
+        env:
+          SCRIPT: ${{ matrix.test }}
+        run: npm run "$SCRIPT"
+      - name: build
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && matrix.build != '' }}
+        env:
+          SCRIPT: ${{ matrix.build }}
+        run: npm run "$SCRIPT"
+
+  migrations:
+    name: migrations
+    needs: detect
+    if: needs.detect.outputs.run_migrations == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        # The version the production MySQL runs; a different major here would test the wrong dialect.
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci
+          MYSQL_DATABASE: ci
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      DATABASE_URL: mysql://root:ci@127.0.0.1:3306/ci
+    defaults:
+      run:
+        working-directory: ${{ needs.detect.outputs.prisma_dir }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.detect.outputs.node }}
+      - name: install
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      # This is what the server runs on every start, so a migration that cannot apply to an empty database breaks the next deploy.
+      - name: prisma migrate deploy
+        run: npx prisma migrate deploy
+      # Drift: the schema file says one thing, the migration history builds another (someone edited schema.prisma and forgot `migrate dev`).
+      # The app would then start fine and fail at runtime on the first query. Compared against the freshly migrated database, so no shadow DB is needed.
+      - name: schema drift check
+        run: |
+          major=$(node -p "require('prisma/package.json').version.split('.')[0]")
+          if [ "$major" -ge 7 ]; then
+            # Prisma 7 renamed these flags; not verified here yet, so say so instead of guessing.
+            echo "::warning::Prisma $major detected: the drift check has not been adapted to its CLI yet and was skipped."
+            exit 0
+          fi
+          npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code \
+            || { echo "::error::prisma/schema.prisma does not match the migrations. Run 'prisma migrate dev --name <change>' and commit the new migration."; exit 1; }
+
+  docker:
+    name: docker (${{ matrix.name }})
+    needs: detect
+    if: needs.detect.outputs.run_docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.detect.outputs.dockerfiles) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          push: false
+          load: ${{ matrix.smoke }}
+          tags: ci-${{ matrix.name }}:test
+          # One cache scope per Dockerfile so the client and server images do not evict each other.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+      # Only for images that can run without a database (see detect.mjs). Any HTTP answer below 500 counts as "started": a redirect or a 404 proves the
+      # server is listening, which is all this step claims.
+      - name: start and probe
+        if: ${{ matrix.smoke }}
+        env:
+          IMAGE: ci-${{ matrix.name }}:test
+          PORT: ${{ matrix.port }}
+        run: |
+          docker run -d --name app -p "8080:${PORT}" "$IMAGE"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8080/ || true)
+            if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then echo "container answered HTTP $code after ~$((i * 2))s"; exit 0; fi
+            sleep 2
+          done
+          echo "::error::the container did not answer on port ${PORT} within 60s (last status ${code:-none}). Its log follows."
+          docker logs app 2>&1 | tail -50
+          exit 1
+
+  audit:
+    name: audit
+    needs: detect
+    if: needs.detect.outputs.run_audit == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # Advisory on purpose: a new advisory against a transitive dependency appears overnight with no commit of ours, so failing the build on it would
+      # make CI flaky. It shows as a warning annotation plus the full report in the log.
+      - name: npm audit (production dependencies)
+        env:
+          APPS: ${{ needs.detect.outputs.apps }}
+        run: |
+          for dir in $(echo "$APPS" | jq -r '.[] | select(.lockfile) | .dir'); do
+            echo "::group::npm audit in $dir"
+            (cd "$dir" && npm audit --omit=dev --audit-level=high) || echo "::warning::npm audit found high or critical vulnerabilities in '$dir' (or could not reach the registry)."
+            echo "::endgroup::"
+          done
+
+  secrets:
+    name: secrets
+    needs: detect
+    if: needs.detect.outputs.run_secrets == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # The binary is downloaded directly and checked against a pinned hash: gitleaks-action needs a paid licence for organisation repositories, and an
+      # unpinned download in a security step would be a supply-chain hole of its own. Bumping the version means updating both lines together.
+      - name: gitleaks
+        env:
+          VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          RANGE: ${{ needs.detect.outputs.secrets_range }}
+        run: |
+          curl -sSfL -o gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA256}  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks
+          # --redact: findings name the file, line and rule but never print the secret. A repo-level .gitleaks.toml or .gitleaksignore is picked up
+          # automatically, which is how a known false positive is allowed.
+          ./gitleaks git --redact --no-banner --log-opts="$RANGE" . \
+            || { echo "::error::gitleaks found a possible secret in the pushed commits (value hidden). If it is real, rotate it; removing it from the code is not enough."; exit 1; }
+
+  # The single result. Skipped tiers are fine; a failed or cancelled one, or a blocking finding from detect, is not.
+  # !cancelled() rather than always(): it still runs after an upstream failure, but a run that a newer push superseded is simply shown as cancelled
+  # instead of being reported as a failure.
+  CI:
+    name: CI
+    needs: [detect, checks, migrations, docker, audit, secrets]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: summarise
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ERRORS: ${{ needs.detect.outputs.error_count }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result == "failure" or .value.result == "cancelled") | .key] | join(", ")')
+          if [ -n "$bad" ]; then echo "::error::failed: $bad"; exit 1; fi
+          if [ "${ERRORS:-0}" != "0" ]; then echo "::error::${ERRORS} blocking finding(s), see the 'CI plan' summary and the detect job."; exit 1; fi
+          echo "all green"

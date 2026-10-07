@@ -1,0 +1,2 @@
+# Workflows contain bash blocks: a CRLF would put a stray  into every command. Keep LF everywhere, whatever the editor or OS does.
+* text=auto eol=lf

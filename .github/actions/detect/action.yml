@@ -1,0 +1,48 @@
+name: detect
+description: Decides which CI checks apply to this repository and why (see detect.mjs). No dependencies; needs only the Node that every GitHub runner already has.
+
+inputs:
+  node-version:
+    description: Force a Node version. Empty means auto-detect (.nvmrc, engines.node, Dockerfile, then 22).
+    default: ''
+  skip:
+    description: Comma-separated check names to turn off (typecheck, lint, test, build, migrations, docker, audit, secrets).
+    default: ''
+  docker:
+    description: auto (only when Docker-relevant files changed or on a default-branch push), always, or never.
+    default: auto
+  migrations:
+    description: auto (only when prisma/ changed or on a default-branch push), always, or never.
+    default: auto
+
+outputs:
+  has_apps: { description: '"true" when at least one npm app was found', value: '${{ steps.plan.outputs.has_apps }}' }
+  apps: { description: 'JSON array, one object per app (name, dir, lockfile, prisma, typecheck, lint, test, build)', value: '${{ steps.plan.outputs.apps }}' }
+  node: { description: 'Node version for setup-node', value: '${{ steps.plan.outputs.node }}' }
+  run_migrations: { description: '"true" when the migration tier should run', value: '${{ steps.plan.outputs.run_migrations }}' }
+  prisma_dir: { description: 'Folder holding prisma/schema.prisma', value: '${{ steps.plan.outputs.prisma_dir }}' }
+  run_docker: { description: '"true" when the Docker tier should run', value: '${{ steps.plan.outputs.run_docker }}' }
+  dockerfiles: { description: 'JSON array, one object per Dockerfile (name, file, context, port, smoke)', value: '${{ steps.plan.outputs.dockerfiles }}' }
+  run_audit: { description: '"true" when npm audit should run', value: '${{ steps.plan.outputs.run_audit }}' }
+  run_secrets: { description: '"true" when the secret scan should run', value: '${{ steps.plan.outputs.run_secrets }}' }
+  secrets_range: { description: 'git log range for the secret scan', value: '${{ steps.plan.outputs.secrets_range }}' }
+  error_count: { description: 'Number of blocking findings; the final CI job fails when this is not 0', value: '${{ steps.plan.outputs.error_count }}' }
+
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      # Everything reaches the script through env, never by interpolating into the command line (branch names and inputs are attacker-controlled text).
+      env:
+        CI_EVENT: ${{ github.event_name }}
+        CI_REF_NAME: ${{ github.ref_name }}
+        CI_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        # Pull request: the PR's own range. Push: the range being pushed (empty on workflow_dispatch and all-zero on a first push, both mean "unknown").
+        CI_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        CI_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        INPUT_NODE_VERSION: ${{ inputs.node-version }}
+        INPUT_SKIP: ${{ inputs.skip }}
+        INPUT_DOCKER: ${{ inputs.docker }}
+        INPUT_MIGRATIONS: ${{ inputs.migrations }}
+      run: node "$GITHUB_ACTION_PATH/detect.mjs"

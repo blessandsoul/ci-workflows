@@ -1,0 +1,31 @@
+# CI for this repository itself: lint the workflow files, then run the shared CI on ourselves (the root package.json's `test` script runs the
+# detector's unit tests). Note the inner `detect@v1` reference resolves to the last RELEASED detector, so the unit tests are what guard a new one.
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: pipx run actionlint-py==1.7.12
+
+  ci:
+    uses: ./.github/workflows/ci.yml
+    with:
+      # No Dockerfile or Prisma here; naming them just keeps the plan short and the intent obvious.
+      skip: migrations,docker
