@@ -225,6 +225,10 @@ jobs:
           push: false
           load: ${{ matrix.smoke }}
           tags: ci-${{ matrix.name }}:test
+          # Some Dockerfiles ask for `RUN --network=host ...` (the servers build them that way, e.g. a Next.js build that fetches fonts). Without this
+          # permission buildx refuses to even load such a Dockerfile ("network.host is not allowed"), so CI would fail on something Coolify builds fine.
+          # It only grants the permission; a Dockerfile that does not use the flag is unaffected, and the runner is a throwaway VM.
+          allow: network.host
           # Only for build-time values the project's image genuinely needs (typically NEXT_PUBLIC_*, which Coolify supplies on a real deploy). Empty by
           # default. An image that does not declare a given ARG just ignores it with a warning.
           build-args: ${{ inputs.docker-build-args }}

@@ -43,6 +43,8 @@ CI by itself only reports. It blocks nothing unless a pull request needs a green
 
 Each run's summary page carries a "CI plan" (what ran and why), and a failed drift check lists the changed columns and tables there (`prisma migrate diff` exit code 2 is drift; any other failure is reported as the command failing, not as drift). The audit job lists each app's vulnerability count. `gh run view --log-failed` shows only "UNKNOWN STEP" for the jobs of a reusable workflow; read the job log through `gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs`, or use `ci_run.py` from the seed-plugins toolkit, which does that and prints just the failing steps.
 
+The Docker job builds with the `network.host` permission granted, so a Dockerfile that uses `RUN --network=host ...` (as several of the server-built images do) is built in CI exactly as the servers build it.
+
 ## CD: deploy to Coolify after green CI
 
 `templates/cd.yml` is a second small caller, written into a project by the seed-plugins `cd_setup.py` tool (a reviewed, confirmed step; never automatic). It runs when the project's **CI workflow succeeds for a push to the default branch** and calls the reusable `cd.yml`, which deploys the project's Coolify applications:
