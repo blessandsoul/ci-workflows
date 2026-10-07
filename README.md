@@ -31,6 +31,7 @@ Copy [templates/ci.yml](templates/ci.yml) to `.github/workflows/ci.yml` (change 
 | `skip` | Comma list of `typecheck, lint, test, build, migrations, docker, audit, secrets` to turn off |
 | `node-version` | Default: `.nvmrc`, then `engines.node`, then the Dockerfile's `FROM node:NN`, then 22 |
 | `docker` / `migrations` | `auto` (default), `always`, `never` |
+| `docker-build-args` | Extra Docker build arguments, one `KEY=VALUE` per line, passed to every image build. For build-time values the image needs and the real deploy supplies (typically `NEXT_PUBLIC_*`). Public placeholders only, never secrets: they appear in the build log |
 
 A known gitleaks false positive is allowed with a `.gitleaksignore` or `.gitleaks.toml` in the project (picked up automatically).
 
@@ -60,7 +61,7 @@ Breaking changes get a new major tag (`v2`) and projects move deliberately. Neve
 - npm only (`package-lock.json`). pnpm and yarn repos are flagged, not checked.
 - Ubuntu runners only, pinned to `ubuntu-24.04`. `ubuntu-latest` changes Ubuntu on GitHub's schedule (26 on 2026-10-19), which would change Docker, Node and every tool under all projects with no commit anywhere. To move on: change the pin in `ci.yml`, run the self-test, then move the tag.
 - The drift check supports Prisma 6. On Prisma 7 it warns that it was skipped rather than guessing the new CLI flags.
-- Build-time environment variables a project needs for `npm run build` or a Docker build are not provided; a project that needs them will fail that step visibly.
+- Build-time environment variables a project needs for `npm run build` or a Docker build are not provided by default; a project that needs them fails that step visibly. For Docker builds, supply public placeholders with the `docker-build-args` input.
 - Private repositories draw on the account's monthly Actions minutes; public ones are free. The concurrency block in the caller, and the heavy jobs waking only on relevant changes, are the cost controls.
 
 ## Development

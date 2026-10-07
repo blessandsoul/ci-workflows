@@ -93,6 +93,17 @@ test('audit: findings become a warning with npm\'s own count, a summary line and
   assert.doesNotMatch(r.out, /nolock/);
 });
 
+// Regression: when every finding has the same severity npm prints "2 high severity vulnerabilities" (not "N vulnerabilities (...)"). That line was
+// not recognised, so a real finding was reported as "could not finish (registry unreachable?)".
+test('audit: the single-severity count line is reported as findings, not as a registry failure', { skip: !haveJq }, () => {
+  const apps = JSON.stringify([{ dir: 'app', lockfile: true }]);
+  const r = runStep(stepScript('npm audit (production dependencies)'), { tool: 'npm', output: 'sharp  <0.35.5\nSeverity: high\n\n2 high severity vulnerabilities\n\nTo address all issues, run:\n  npm audit fix\n', code: 1, env: { APPS: apps } });
+  assert.equal(r.status, 0);
+  assert.match(r.out, /::warning::npm audit in 'app': 2 high severity vulnerabilities/);
+  assert.match(r.summary, /- \*\*app\*\*: 2 high severity vulnerabilities/);
+  assert.doesNotMatch(r.out, /could not finish/);
+});
+
 test('audit: a clean app is listed as clean; a registry failure says it could not finish', { skip: !haveJq }, () => {
   const apps = JSON.stringify([{ dir: 'app', lockfile: true }]);
   const clean = runStep(stepScript('npm audit (production dependencies)'), { tool: 'npm', output: 'found 0 vulnerabilities\n', code: 0, env: { APPS: apps } });

@@ -35,6 +35,10 @@ on:
         description: auto, always or never.
         type: string
         default: auto
+      docker-build-args:
+        description: 'Extra Docker build arguments, one KEY=VALUE per line, passed to every image build. PUBLIC placeholders only, never secrets (they are visible in the build log).'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -221,6 +225,9 @@ jobs:
           push: false
           load: ${{ matrix.smoke }}
           tags: ci-${{ matrix.name }}:test
+          # Only for build-time values the project's image genuinely needs (typically NEXT_PUBLIC_*, which Coolify supplies on a real deploy). Empty by
+          # default. An image that does not declare a given ARG just ignores it with a warning.
+          build-args: ${{ inputs.docker-build-args }}
           # One cache scope per Dockerfile so the client and server images do not evict each other.
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,scope=${{ matrix.name }},mode=max
@@ -268,7 +275,8 @@ jobs:
               continue
             fi
             # npm ends its report with a line like "7 vulnerabilities (1 low, 3 moderate, 3 high)"; that line is the useful part of the annotation.
-            total=$(echo "$report" | grep -E '[0-9]+ vulnerabilit' | tail -1 || true)
+            # Two shapes: "7 vulnerabilities (1 low, 3 moderate, 3 high)" and, when every finding has the same severity, "2 high severity vulnerabilities".
+            total=$(echo "$report" | grep -E '[0-9]+ ([a-z]+ severity )?vulnerabilit' | tail -1 || true)
             if [ -n "$total" ]; then
               echo "::warning::npm audit in '$dir': $total (full report in the audit job log)"
               echo "- **$dir**: $total" >> "$GITHUB_STEP_SUMMARY"
