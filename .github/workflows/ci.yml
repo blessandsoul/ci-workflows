@@ -194,7 +194,7 @@ jobs:
             echo "${changes:-$report}"
             echo '```'
             echo
-            echo 'Fix: run `prisma migrate dev --name <change>` and commit the new migration folder. A migration that exists only in a working copy (not committed) is the usual cause.'
+            echo "Fix: run prisma migrate dev --name <change> and commit the new migration folder. A migration that exists only in a working copy (not committed) is the usual cause."
           } >> "$GITHUB_STEP_SUMMARY"
           count=$(echo "$changes" | grep -c . || true)
           echo "::error::prisma/schema.prisma does not match the migrations ($count change lines, listed on the run summary). Run 'prisma migrate dev --name <change>' and commit the new migration."

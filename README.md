@@ -65,4 +65,4 @@ Breaking changes get a new major tag (`v2`) and projects move deliberately. Neve
 
 ## Development
 
-`npm test` runs the detector's offline unit tests (`node --test`, no dependencies, builds throwaway git repos as fixtures). `self-test.yml` lints the workflow files with actionlint and runs this repository through its own CI.
+`npm test` runs the detector's offline unit tests (`node --test`, no dependencies, builds throwaway git repos as fixtures). `self-test.yml` lints the workflow files with actionlint and runs this repository through its own CI. Lint locally the way the runner does, with shellcheck included (without it, shell problems inside `run:` blocks only show up after the push): `uv tool run --from actionlint-py --with shellcheck-py actionlint`. The audit tests need `jq`, which runners have.
