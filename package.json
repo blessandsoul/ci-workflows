@@ -4,6 +4,6 @@
   "type": "module",
   "description": "Shared GitHub Actions CI for the create-tigra style repositories: one reusable workflow, a small detector, no per-project configuration.",
   "scripts": {
-    "test": "node --test .github/actions/detect/detect.test.mjs"
+    "test": "node --test \"test/*.test.mjs\" \".github/actions/detect/*.test.mjs\""
   }
 }

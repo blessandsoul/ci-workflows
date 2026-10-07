@@ -10,6 +10,9 @@
 #
 # Releases: the composite action below is referenced at @v1 because a reusable workflow cannot refer to "the same ref as me". Moving the v1 tag
 # releases a change to every caller at once; see the README.
+#
+# Runners are pinned to ubuntu-24.04 on purpose: `ubuntu-latest` moves to a new Ubuntu on GitHub's schedule (26 on 2026-10-19), which would change
+# Docker, Node and every tool under all callers with no commit anywhere. Bump the pin deliberately, test, then move the tag.
 
 name: CI (reusable)
 
@@ -45,7 +48,7 @@ env:
 jobs:
   detect:
     name: detect
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       has_apps: ${{ steps.plan.outputs.has_apps }}
@@ -76,7 +79,7 @@ jobs:
     name: checks (${{ matrix.name }})
     needs: detect
     if: needs.detect.outputs.has_apps == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -129,7 +132,7 @@ jobs:
     name: migrations
     needs: detect
     if: needs.detect.outputs.run_migrations == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     services:
       mysql:
@@ -170,14 +173,38 @@ jobs:
             echo "::warning::Prisma $major detected: the drift check has not been adapted to its CLI yet and was skipped."
             exit 0
           fi
-          npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code \
-            || { echo "::error::prisma/schema.prisma does not match the migrations. Run 'prisma migrate dev --name <change>' and commit the new migration."; exit 1; }
+          # `--exit-code` gives 0 for no differences, 2 for differences and 1 when the command itself failed; only 2 is drift. Reporting a connection
+          # error as "your schema drifted" would send people looking in the wrong place.
+          code=0
+          report=$(npx prisma migrate diff --from-url "$DATABASE_URL" --to-schema-datamodel prisma/schema.prisma --exit-code 2>&1) || code=$?
+          echo "$report"
+          [ "$code" -eq 0 ] && exit 0
+          if [ "$code" -ne 2 ]; then
+            echo "::error::prisma migrate diff could not run (exit $code); see the log above."
+            exit 1
+          fi
+          # Only the diff lines are useful on the summary page; Prisma also prints notices around them.
+          changes=$(echo "$report" | grep -E '^[[:space:]]*\[[-+*]\]' | head -60 || true)
+          {
+            echo "### Schema drift"
+            echo
+            echo 'prisma/schema.prisma does not match what the committed migrations build. Prisma would change:'
+            echo
+            echo '```'
+            echo "${changes:-$report}"
+            echo '```'
+            echo
+            echo 'Fix: run `prisma migrate dev --name <change>` and commit the new migration folder. A migration that exists only in a working copy (not committed) is the usual cause.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          count=$(echo "$changes" | grep -c . || true)
+          echo "::error::prisma/schema.prisma does not match the migrations ($count change lines, listed on the run summary). Run 'prisma migrate dev --name <change>' and commit the new migration."
+          exit 1
 
   docker:
     name: docker (${{ matrix.name }})
     needs: detect
     if: needs.detect.outputs.run_docker == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -219,7 +246,7 @@ jobs:
     name: audit
     needs: detect
     if: needs.detect.outputs.run_audit == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -229,17 +256,33 @@ jobs:
         env:
           APPS: ${{ needs.detect.outputs.apps }}
         run: |
+          echo "### npm audit (production dependencies)" >> "$GITHUB_STEP_SUMMARY"
           for dir in $(echo "$APPS" | jq -r '.[] | select(.lockfile) | .dir'); do
             echo "::group::npm audit in $dir"
-            (cd "$dir" && npm audit --omit=dev --audit-level=high) || echo "::warning::npm audit found high or critical vulnerabilities in '$dir' (or could not reach the registry)."
+            code=0
+            report=$(cd "$dir" && npm audit --omit=dev --audit-level=high 2>&1) || code=$?
+            echo "$report"
             echo "::endgroup::"
+            if [ "$code" -eq 0 ]; then
+              echo "- **$dir**: no high or critical vulnerabilities" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            # npm ends its report with a line like "7 vulnerabilities (1 low, 3 moderate, 3 high)"; that line is the useful part of the annotation.
+            total=$(echo "$report" | grep -E '[0-9]+ vulnerabilit' | tail -1 || true)
+            if [ -n "$total" ]; then
+              echo "::warning::npm audit in '$dir': $total (full report in the audit job log)"
+              echo "- **$dir**: $total" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::npm audit in '$dir' could not finish (registry unreachable?)."
+              echo "- **$dir**: could not finish" >> "$GITHUB_STEP_SUMMARY"
+            fi
           done
 
   secrets:
     name: secrets
     needs: detect
     if: needs.detect.outputs.run_secrets == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -268,7 +311,7 @@ jobs:
     name: CI
     needs: [detect, checks, migrations, docker, audit, secrets]
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: summarise
