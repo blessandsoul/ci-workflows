@@ -6,7 +6,12 @@
 //
 // Principles
 //  * Never silently skip something that should run. If a check cannot run (for example no package-lock.json) the plan says so as a finding.
-//  * Cheap checks always run; expensive ones (Docker build, migrations) run only when something they depend on changed, or on a push to the default branch.
+//  * Cheap checks run on every push; expensive ones run only when something they alone can verify changed, on EVERY branch including the default
+//    one (projects push straight to main and CD waits for this CI, so "always on main" made every deploy wait for image builds):
+//      - docker-check (seconds): every Dockerfile's static rules and lockfile, see ../dockerfile-check/dockerfile-check.mjs.
+//      - docker (minutes): an image is built only when something it is built from, and nothing cheaper verifies, changed (imageTrigger below).
+//      - migrations: only when the Prisma folder or the Prisma app's dependencies changed.
+//    When the changed files cannot be known (first push, manual run, force-push over a missing commit) everything runs: never less, only more.
 //  * No dependencies: plain Node, so it can be unit-tested offline with `node --test`.
 
 import fs from 'node:fs';
@@ -14,23 +19,21 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-// Never searched for Dockerfiles. Besides build output this includes folders that hold COPIES of the project (found in a real repo: outputs/<run>/client/Dockerfile
-// snapshots), which would otherwise be built on every run for nothing.
-export const IGNORED_DIRS = new Set([
-  'node_modules', '.git', '.next', 'dist', 'build', 'coverage', '.turbo', '.cache',
-  'outputs', 'output', 'docs', 'examples', 'archive', 'tmp', 'vendor', 'fixtures', '.claude', '.worktrees', 'worktrees',
-]);
+import { analyse, findDockerfiles as findDockerfilePaths, Ignore, IGNORED_DIRS } from '../dockerfile-check/dockerfile-check.mjs';
+
+export { IGNORED_DIRS };
 // More than this many images in one repo is almost certainly not "the app"; build the first ones and say what was left out.
 export const MAX_DOCKERFILES = 8;
 // Folders that can hold an npm app. '.' covers flat repos and "client at the root, server in /server".
 const APP_DIR_CANDIDATES = ['.', 'client', 'server', 'web', 'api', 'frontend', 'backend'];
 const SCRIPT_ALIASES = { typecheck: ['typecheck', 'type-check', 'check-types', 'tsc'], lint: ['lint'], test: ['test'], build: ['build'] };
 const PLACEHOLDER_TEST = /no test specified/i; // the `npm init` default must not count as a test suite
-// Changes that can alter how an image builds or how the database schema behaves: these wake up the Docker and migration tiers.
-const DOCKER_TRIGGERS = /(^|\/)(Dockerfile[^/]*|\.dockerignore|package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$|(^|\/)prisma\//;
-const PRISMA_TRIGGERS = /(^|\/)prisma\//;
-const PUBLIC_REGISTRIES = new Set(['docker.io', 'index.docker.io', 'ghcr.io', 'gcr.io', 'quay.io', 'public.ecr.aws', 'mcr.microsoft.com', 'registry.k8s.io']);
-export const CHECK_NAMES = ['typecheck', 'lint', 'test', 'build', 'migrations', 'docker', 'audit', 'secrets'];
+// Dependency manifests: in a folder whose package files an image copies (where its `npm ci` runs), a change to one of these changes the image.
+const DEPENDENCY_FILES = new Set(['package.json', 'package-lock.json', 'npm-shrinkwrap.json', '.npmrc', 'pnpm-lock.yaml', 'yarn.lock']);
+// Prisma files that change the generated client or what `migrate deploy` applies, relative to the app folder. Not everything under prisma/: seed
+// scripts and data kept there (arki-magazine's production-editorial content) are neither, and used to trigger builds and migrations for nothing.
+const PRISMA_INPUT = /^(?:prisma\/(?:schema\.prisma|schema\/.+|migrations\/.+)|prisma\.config\.[cm]?[jt]s)$/;
+export const CHECK_NAMES = ['typecheck', 'lint', 'test', 'build', 'migrations', 'docker', 'docker-check', 'audit', 'secrets'];
 
 function readJson(file) {
   try {
@@ -115,61 +118,55 @@ export function findApps(root) {
   return { apps: kept, findings };
 }
 
-/** Dockerfiles in the repo root or up to two folders down (`Dockerfile`, `client/Dockerfile`, `services/api/Dockerfile`), each with context, port and findings. */
+/** Dockerfiles in the repo root or up to two folders down (`Dockerfile`, `client/Dockerfile`, `services/api/Dockerfile`), each analysed. */
 export function findDockerfiles(root) {
-  const out = [];
-  const walk = (dir, depth) => {
-    if (depth > 2) return;
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      if (e.isDirectory()) {
-        if (!IGNORED_DIRS.has(e.name)) walk(path.join(dir, e.name), depth + 1);
-      // `Dockerfile`, `Dockerfile.prod`, ...; but not `Dockerfile.dockerignore`, which is BuildKit's per-Dockerfile ignore list, not a build recipe.
-      } else if (/^Dockerfile(\..+)?$/.test(e.name) && !e.name.endsWith('.dockerignore')) {
-        const abs = path.join(dir, e.name);
-        out.push(analyseDockerfile(root, abs));
-      }
-    }
-  };
-  walk(root, 0);
-  return out.sort((a, b) => a.file.localeCompare(b.file));
+  return findDockerfilePaths(root).map((abs) => analyseDockerfile(root, abs)).sort((a, b) => a.file.localeCompare(b.file));
 }
 
+/**
+ * What the planner needs to know about one Dockerfile. The analysis is the docker-check job's own (one parser, one idea of the build context); its
+ * findings are reported by that job, not here, so they appear once. The image is built from the same context the check uses: the Dockerfile's
+ * folder, or the repo root for a monorepo Dockerfile whose COPY sources only exist there (project-fire's ai-runtime and aichats-agent).
+ */
 export function analyseDockerfile(root, abs) {
-  const text = fs.readFileSync(abs, 'utf8');
-  const file = path.relative(root, abs).split(path.sep).join('/');
-  const contextDir = path.dirname(file) === '.' ? '.' : path.dirname(file);
-  const findings = [];
-  const stages = new Set();
-  for (const m of text.matchAll(/^\s*FROM\s+(?:--platform=\S+\s+)?(\S+)(?:\s+AS\s+(\S+))?/gim)) {
-    const image = m[1];
-    if (m[2]) stages.add(m[2].toLowerCase());
-    if (stages.has(image.toLowerCase()) || image.includes('$') || image.toLowerCase() === 'scratch') continue;
-    const first = image.split('/')[0];
-    const hasHost = image.includes('/') && (first.includes('.') || first.includes(':') || first === 'localhost');
-    if (hasHost) {
-      const host = first.split(':')[0].toLowerCase();
-      if (['localhost', '127.0.0.1', '0.0.0.0'].includes(host) || host.endsWith('.local') || /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) {
-        findings.push({ level: 'error', where: file, message: `${file}: FROM ${image} uses a registry that only exists on one machine. The build fails everywhere else.` });
-      } else if (!PUBLIC_REGISTRIES.has(host)) {
-        findings.push({ level: 'warn', where: file, message: `${file}: FROM ${image} uses a non-public registry (${host}); make sure CI and the servers can reach it.` });
-      }
-    }
-    const tag = image.includes('@') ? 'pinned' : image.split('/').pop().split(':')[1];
-    if (!tag || tag === 'latest') findings.push({ level: 'warn', where: file, message: `${file}: FROM ${image} is not pinned to a version, builds can change without a commit.` });
+  const a = analyse(root, abs);
+  return {
+    file: a.file,
+    context: a.context,
+    contextInferred: a.contextInferred,
+    name: a.file.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'root',
+    port: a.port,
+    text: a.text,
+    sources: a.sources,
+    copiesWholeContext: a.copiesWholeContext,
+    npmFolders: a.npmFolders,
+  };
+}
+
+/**
+ * Why changed file `f` means image `d` must be rebuilt, or '' when it does not. A full build only runs for what nothing cheaper verifies: code
+ * inside an npm app is compiled and tested by the checks job, and every Dockerfile is checked statically by docker-check, so a code-only push builds
+ * nothing. `checkedDirs` are the app folders whose code the checks job compiles. Every rule errs towards building.
+ */
+export function imageTrigger(d, f, checkedDirs) {
+  const ctx = d.context === '.' ? '' : `${d.context}/`;
+  if (f === d.file || f === `${d.file}.dockerignore` || f === `${ctx}.dockerignore`) return 'its Dockerfile or .dockerignore changed';
+  for (const dir of d.npmFolders) {
+    const prefix = dir === '.' ? '' : `${dir}/`;
+    if (f.startsWith(prefix) && DEPENDENCY_FILES.has(f.slice(prefix.length))) return 'its dependencies changed';
+    if (f.startsWith(prefix) && PRISMA_INPUT.test(f.slice(prefix.length))) return 'its Prisma schema or migrations changed';
   }
-  const hasHealthcheck = /^\s*HEALTHCHECK\s/im.test(text);
-  const hasHttpTool = /\b(curl|wget)\b/.test(text);
-  if (!hasHealthcheck && !hasHttpTool) {
-    findings.push({ level: 'warn', where: file, message: `${file}: no HEALTHCHECK and no curl/wget; Coolify's HTTP health check needs one of them inside the image.` });
+  if (!f.startsWith(ctx)) return '';
+  const rel = f.slice(ctx.length);
+  // Files and folders the Dockerfile copies by name: start scripts, configs, vendored packages, or the whole code of a non-npm service.
+  for (const s of d.sources) {
+    const hit = s.glob ? !!Ignore.compile(s.path)?.test(rel) : rel === s.path || rel.startsWith(`${s.path}/`);
+    if (hit) return 'a file it copies by name changed';
   }
-  const port = (text.match(/^\s*EXPOSE\s+(\d+)/im) || [])[1] || '';
-  return { file, context: contextDir, name: file.replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase() || 'root', port, findings, text };
+  // `COPY . .` of code no checks job compiles (a Python or Go service): the image build is the only check that code gets.
+  const covered = d.npmFolders.length > 0 && d.npmFolders.every((dir) => checkedDirs.has(dir));
+  if (d.copiesWholeContext && !covered) return 'its build context changed and no app check covers that code';
+  return '';
 }
 
 /**
@@ -196,12 +193,12 @@ export function detect(root, ctx = {}) {
   const allDockerfiles = findDockerfiles(root);
   const dockerfiles = allDockerfiles.slice(0, MAX_DOCKERFILES);
   if (allDockerfiles.length > MAX_DOCKERFILES) {
-    findings.push({ level: 'warn', where: 'docker', message: `${allDockerfiles.length} Dockerfiles found; only the first ${MAX_DOCKERFILES} are built. Not built: ${allDockerfiles.slice(MAX_DOCKERFILES).map((d) => d.file).join(', ')}.` });
+    findings.push({ level: 'warn', where: 'docker', message: `${allDockerfiles.length} Dockerfiles found; only the first ${MAX_DOCKERFILES} are ever built (docker-check still checks them all). Never built: ${allDockerfiles.slice(MAX_DOCKERFILES).map((d) => d.file).join(', ')}.` });
   }
   const changed = changedFiles(root, ctx.base, ctx.head);
+  // Shown on the summary only. It no longer forces anything: the default branch gets the same change-based plan as every other branch.
   const isDefaultPush = ctx.event === 'push' && !!ctx.refName && ctx.refName === ctx.defaultBranch;
   const reasons = [];
-  const wakes = (re) => changed === null || changed.some((f) => re.test(f));
 
   for (const s of unknownSkips) findings.push({ level: 'warn', where: 'inputs', message: `skip: "${s}" is not a known check (${CHECK_NAMES.join(', ')}).` });
 
@@ -220,34 +217,66 @@ export function detect(root, ctx = {}) {
     return out;
   });
 
-  // Migrations tier
+  // Migrations tier: `prisma migrate deploy` and the drift check depend on the schema, the migrations and the Prisma version (the app's package files).
   const prismaApp = plannedApps.find((a) => a.prisma);
   const hasMigrations = !!prismaApp && exists(root, prismaApp.dir, 'prisma', 'migrations') && fs.readdirSync(path.join(root, prismaApp.dir, 'prisma', 'migrations')).some((n) => !n.startsWith('.') && n !== 'migration_lock.toml');
+  const prismaPrefix = prismaApp && prismaApp.dir !== '.' ? `${prismaApp.dir}/` : '';
+  const migrationInput = (f) => f.startsWith(prismaPrefix) && (PRISMA_INPUT.test(f.slice(prismaPrefix.length)) || ['package.json', 'package-lock.json'].includes(f.slice(prismaPrefix.length)));
   let runMigrations = false;
   if (!prismaApp) reasons.push('migrations: skipped, no Prisma schema found');
   else if (!hasMigrations) reasons.push('migrations: skipped, Prisma schema has no migrations folder');
   else if (skip.has('migrations') || ctx.migrations === 'never') reasons.push('migrations: skipped, turned off by the caller');
-  else if (ctx.migrations === 'always' || isDefaultPush || wakes(PRISMA_TRIGGERS)) runMigrations = true;
-  else reasons.push('migrations: skipped, nothing under prisma/ changed (runs on pushes to the default branch)');
+  else if (ctx.migrations === 'always' || changed === null || changed.some(migrationInput)) runMigrations = true;
+  else reasons.push(`migrations: skipped, no change to the Prisma schema, migrations or dependencies in ${prismaApp.dir === '.' ? 'the repo root' : prismaApp.dir}`);
 
-  // Docker tier
-  let runDocker = false;
+  // Docker check: every Dockerfile, every push. Cheap, so it is not capped like the builds are.
+  let runDockerCheck = false;
+  if (!allDockerfiles.length) reasons.push('docker-check: skipped, no Dockerfile found');
+  else if (skip.has('docker-check')) reasons.push('docker-check: skipped, turned off by the caller');
+  else runDockerCheck = true;
+
+  // Docker builds: per image, only when something it is built from changed (see imageTrigger).
+  const checkedDirs = new Set(plannedApps.filter((a) => a.typecheck || a.build).map((a) => a.dir));
+  const toBuild = [];
   if (!dockerfiles.length) reasons.push('docker: skipped, no Dockerfile found');
   else if (skip.has('docker') || ctx.docker === 'never') reasons.push('docker: skipped, turned off by the caller');
-  else if (ctx.docker === 'always' || isDefaultPush || wakes(DOCKER_TRIGGERS)) runDocker = true;
-  else reasons.push('docker: skipped, no Dockerfile or dependency change (runs on pushes to the default branch)');
+  else {
+    for (const d of dockerfiles) {
+      let why = '';
+      if (ctx.docker === 'always') why = 'docker: always';
+      else if (changed === null) why = 'changed files unknown';
+      else {
+        for (const f of changed) {
+          const reason = imageTrigger(d, f, checkedDirs);
+          if (reason) {
+            why = `${reason} (${f})`;
+            break;
+          }
+        }
+      }
+      if (why) toBuild.push({ ...d, why });
+      else reasons.push(`docker: ${d.file} not built, nothing it is built from changed (docker-check still checked it)`);
+    }
+  }
+  const runDocker = toBuild.length > 0;
 
-  // A container is only started when it can plausibly run without a database: no Prisma next to it, no DATABASE_URL in its .env.example.
-  const dockerPlan = dockerfiles.map((d) => {
-    const ctxDir = d.context;
-    const hasPrisma = exists(root, ctxDir, 'prisma', 'schema.prisma');
-    const envExample = ['.env.example', '.env.sample'].map((f) => path.join(root, ctxDir, f)).find((f) => fs.existsSync(f));
-    const wantsDb = envExample ? /DATABASE_URL|MYSQL_|REDIS_URL/.test(fs.readFileSync(envExample, 'utf8')) : false;
-    const smoke = !!d.port && !hasPrisma && !wantsDb;
-    const { text, ...rest } = d;
-    return { ...rest, smoke, smokeNote: smoke ? '' : d.port ? 'start skipped: needs a database (migrations tier covers it)' : 'start skipped: no EXPOSE found' };
+  // A container is only started when it can plausibly run with no configuration: no Prisma next to it, and an .env.example (if any) that names
+  // neither a database nor a secret. An app that refuses to start without its secrets (project-fire's aichats-agent reads two key files at
+  // startup) would otherwise fail the probe for a reason that is not a bug. Browser-visible NEXT_PUBLIC_* names never count as secrets. Both are
+  // looked for beside the Dockerfile, which is the app's folder even when the build context is the repo root.
+  const dockerPlan = toBuild.map((d) => {
+    const appDir = path.posix.dirname(d.file);
+    const hasPrisma = exists(root, appDir, 'prisma', 'schema.prisma');
+    const envExample = ['.env.example', '.env.sample'].map((f) => path.join(root, appDir, f)).find((f) => fs.existsSync(f));
+    const envText = envExample ? fs.readFileSync(envExample, 'utf8') : '';
+    const wantsDb = /DATABASE_URL|MYSQL_|REDIS_URL/.test(envText);
+    const wantsSecret = /^\s*(?!NEXT_PUBLIC_)[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|_FILE)\s*=/m.test(envText);
+    const smoke = !!d.port && !hasPrisma && !wantsDb && !wantsSecret;
+    const { text, sources, copiesWholeContext, npmFolders, ...rest } = d;
+    const smokeNote = smoke ? '' : !d.port ? 'start skipped: no EXPOSE found'
+      : hasPrisma || wantsDb ? 'start skipped: needs a database (migrations tier covers it)' : 'start skipped: needs secrets (its .env.example names one)';
+    return { ...rest, smoke, smokeNote };
   });
-  findings.push(...dockerPlan.flatMap((d) => d.findings));
 
   if (!plannedApps.length) findings.push({ level: 'warn', where: 'repo', message: 'No npm app found in ., client, server, web, api, frontend or backend, so there are no code checks to run.' });
   if (plannedApps.some((a) => !a.lockfile) && plannedApps.every((a) => !a.lockfile)) reasons.push('audit: skipped, no package-lock.json');
@@ -264,6 +293,8 @@ export function detect(root, ctx = {}) {
     runMigrations,
     dockerfiles: dockerPlan,
     runDocker,
+    dockerChecked: allDockerfiles.map((d) => d.file),
+    runDockerCheck,
     runAudit,
     runSecrets,
     secretsRange: range,
@@ -286,7 +317,8 @@ function setOutput(name, value) {
 export function runLines(plan) {
   const lines = [];
   if (plan.runMigrations) lines.push(`migrations: run (Prisma in ${plan.prismaDir === '.' ? 'the repo root' : plan.prismaDir})`);
-  if (plan.runDocker) lines.push(`docker: run (${plan.dockerfiles.map((d) => `${d.file}${d.smoke ? ', started and probed' : ', build only'}`).join('; ')})`);
+  if (plan.runDockerCheck) lines.push(`docker-check: run (${plan.dockerChecked.join(', ')}: static rules and lockfile, no build)`);
+  if (plan.runDocker) lines.push(`docker: run (${plan.dockerfiles.map((d) => `${d.file}${d.context !== path.posix.dirname(d.file) ? ` from ${d.context === '.' ? 'the repo root' : d.context}` : ''}${d.smoke ? ', started and probed' : ', build only'}: ${d.why}`).join('; ')})`);
   if (plan.runAudit) lines.push('audit: run (advisory)');
   if (plan.runSecrets) lines.push('secrets: run');
   return lines;
@@ -324,15 +356,16 @@ function main() {
   setOutput('node', plan.node);
   setOutput('run_migrations', plan.runMigrations ? 'true' : 'false');
   setOutput('prisma_dir', plan.prismaDir);
+  setOutput('run_docker_check', plan.runDockerCheck ? 'true' : 'false');
   setOutput('run_docker', plan.runDocker ? 'true' : 'false');
-  // Findings are already reported once as annotations; the matrix only needs what a build job uses.
-  setOutput('dockerfiles', plan.dockerfiles.map(({ findings, ...build }) => build));
+  // Only the images to build, and only what a build job uses.
+  setOutput('dockerfiles', plan.dockerfiles.map(({ file, context, name, port, smoke }) => ({ file, context, name, port, smoke })));
   setOutput('run_audit', plan.runAudit ? 'true' : 'false');
   setOutput('run_secrets', plan.runSecrets ? 'true' : 'false');
   setOutput('secrets_range', plan.secretsRange);
   setOutput('plan', plan);
-  // Error-level findings (a Dockerfile that can only build on one machine, an unsupported package manager) do not stop the other jobs from running,
-  // but the final `CI` job turns them into a failure so they are never just a yellow annotation.
+  // Error-level findings (an app on an unsupported package manager) do not stop the other jobs from running, but the final `CI` job turns them into
+  // a failure so they are never just a yellow annotation. Dockerfile errors are the docker-check job's, which fails by itself.
   setOutput('error_count', String(plan.findings.filter((f) => f.level === 'error').length));
   if (env.GITHUB_STEP_SUMMARY) fs.appendFileSync(env.GITHUB_STEP_SUMMARY, summaryOf(plan));
   console.log(`apps: ${plan.apps.map((a) => a.name).join(', ') || 'none'} | node ${plan.node} | changed: ${plan.changed}`);

@@ -21,7 +21,7 @@ jobs:
   ci:
     uses: blessandsoul/ci-workflows/.github/workflows/ci.yml@v1
     # with:
-    #   skip: "test"          # any of: typecheck, lint, test, build, migrations, docker, audit, secrets
+    #   skip: "test"          # any of: typecheck, lint, test, build, migrations, docker, docker-check, audit, secrets
     #   node-version: "22"    # default: from .nvmrc, package.json engines or the Dockerfile
-    #   docker: always        # auto (only when image inputs change) | always | never
+    #   docker: always        # image builds: auto (only images whose inputs changed) | always | never
     #   migrations: always    # auto | always | never

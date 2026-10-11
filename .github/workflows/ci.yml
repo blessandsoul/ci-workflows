@@ -2,11 +2,15 @@
 #
 #   detect      decides what applies (see .github/actions/detect/detect.mjs) and publishes the plan on the run summary
 #   checks      per app: install, typecheck, lint, test, build (all four always run, so one run shows every failure)
-#   migrations  Prisma migrations against a throwaway MySQL 8.4, then a drift check (only when prisma/ changed, or on a default-branch push)
-#   docker      builds each Dockerfile, starts DB-free images and probes them (only when image inputs changed, or on a default-branch push)
+#   migrations  Prisma migrations against a throwaway MySQL 8.4, then a drift check (only when the schema, migrations or Prisma app's dependencies changed)
+#   docker-check every Dockerfile without building it: static rules plus the lockfile under the image's npm (every push, seconds)
+#   docker      builds an image, starts it if it needs no database or secrets and probes it (only when something that image is built from changed)
 #   audit       npm audit for production dependencies (advisory)
 #   secrets     gitleaks over the pushed commits (fails on a finding, values redacted)
 #   CI          the one job that summarises everything; require THIS one in branch protection
+#
+# The default branch gets the same change-based plan as any other branch: projects push straight to main and CD waits for this CI, so building
+# every image on every push made each deploy wait minutes for nothing. A manual run (workflow_dispatch) cannot know what changed, so it runs everything.
 #
 # Releases: the composite action below is referenced at @v1 because a reusable workflow cannot refer to "the same ref as me". Moving the v1 tag
 # releases a change to every caller at once; see the README.
@@ -24,11 +28,11 @@ on:
         type: string
         default: ''
       skip:
-        description: 'Comma-separated checks to turn off: typecheck, lint, test, build, migrations, docker, audit, secrets.'
+        description: 'Comma-separated checks to turn off: typecheck, lint, test, build, migrations, docker, docker-check, audit, secrets.'
         type: string
         default: ''
       docker:
-        description: auto, always or never.
+        description: 'Image builds: auto (only images whose inputs changed), always or never. Never does not turn off docker-check; skip it by name.'
         type: string
         default: auto
       migrations:
@@ -60,6 +64,7 @@ jobs:
       node: ${{ steps.plan.outputs.node }}
       run_migrations: ${{ steps.plan.outputs.run_migrations }}
       prisma_dir: ${{ steps.plan.outputs.prisma_dir }}
+      run_docker_check: ${{ steps.plan.outputs.run_docker_check }}
       run_docker: ${{ steps.plan.outputs.run_docker }}
       dockerfiles: ${{ steps.plan.outputs.dockerfiles }}
       run_audit: ${{ steps.plan.outputs.run_audit }}
@@ -204,6 +209,24 @@ jobs:
           echo "::error::prisma/schema.prisma does not match the migrations ($count change lines, listed on the run summary). Run 'prisma migrate dev --name <change>' and commit the new migration."
           exit 1
 
+  # Every push: the problems a build would hit that can be seen without building (missing or .dockerignore'd COPY sources, a registry that only
+  # exists on one machine, bad COPY --from, a lockfile the image's npm rejects). This is what lets the full build below run only on real changes.
+  docker-check:
+    name: docker-check
+    needs: detect
+    if: needs.detect.outputs.run_docker_check == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # A pinned Node rather than whatever the runner image ships; `npx npm@N` needs a Node new enough for npm 11.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ needs.detect.outputs.node }}
+      - uses: blessandsoul/ci-workflows/.github/actions/dockerfile-check@v1
+        with:
+          build-args: ${{ inputs.docker-build-args }}
+
   docker:
     name: docker (${{ matrix.name }})
     needs: detect
@@ -321,7 +344,7 @@ jobs:
   # instead of being reported as a failure.
   CI:
     name: CI
-    needs: [detect, checks, migrations, docker, audit, secrets]
+    needs: [detect, checks, migrations, docker-check, docker, audit, secrets]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5

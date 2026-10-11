@@ -12,15 +12,29 @@ Everything runs on GitHub's machines, never on your PC.
 |---|---|---|
 | detect | Looks at the repo, decides what applies, writes the plan on the run summary | always |
 | checks (per app) | `npm ci`, then typecheck, lint, test, build. All four run even if one fails, so one run shows every problem | always |
-| migrations | Prisma `migrate deploy` against a throwaway MySQL 8.4, then a drift check (schema file vs migration history) | `prisma/` changed, or a push to the default branch |
-| docker (per Dockerfile) | Static findings, `docker build`, and for images that need no database: start and probe | a Dockerfile, `.dockerignore`, `package*.json`, lockfile or `prisma/` changed, or a push to the default branch |
+| migrations | Prisma `migrate deploy` against a throwaway MySQL 8.4, then a drift check (schema file vs migration history) | the Prisma app's schema, migrations, `prisma.config`, `package.json` or lockfile changed (not seed scripts or data kept under `prisma/`) |
+| docker-check | Every Dockerfile, without building it: the static rules below, plus `npm ci --dry-run` under the npm version the image's Node ships. Seconds | always (when the repo has a Dockerfile) |
+| docker (per image) | `docker build`, and for images that need no database and no secrets (judged from Prisma and the `.env.example` beside the Dockerfile): start and probe | something that image is built from changed (see below) |
 | audit | `npm audit --omit=dev --audit-level=high`, advisory (a warning, never a failure) | always |
 | secrets | gitleaks over the pushed commits, values redacted. Fails on a finding | always |
 | **CI** | One summary job. Fails if anything failed or detect raised a blocking finding | always |
 
 Apps are looked for in `.`, `client`, `server`, `web`, `api`, `frontend`, `backend`. A script is only run if the app has it (`typecheck`, `type-check`, `check-types` or `tsc`; `lint`; `test`; `build`), and the `npm init` placeholder test script is ignored.
 
-Blocking findings (they turn the **CI** job red): a Dockerfile whose `FROM` points at a registry that exists on one machine only (`localhost:5000/...`, private IPs, `.local`), and an app that uses pnpm or yarn only (unsupported, so it would otherwise be silently unchecked). Everything else the detector notices is a warning annotation: unpinned image tags, no `HEALTHCHECK` or `curl`/`wget` for Coolify's health check, no lockfile, missing scripts.
+Blocking findings (they turn the **CI** job red): from **docker-check**, a `FROM` registry that exists on one machine only (`localhost:5000/...`, private IPs, `.local`), a `COPY` source that is missing (also when only the letter case differs) or hidden by `.dockerignore`, a `COPY --from` naming a stage that is not defined earlier, `npm ci` without a lockfile, and a lockfile the image's npm rejects; from **detect**, an app that uses pnpm or yarn only (unsupported, so it would otherwise be silently unchecked). Everything else is a warning annotation: unpinned image tags, no `HEALTHCHECK` or `curl`/`wget` for Coolify's health check, an `ARG` without a default copied into `ENV` (empty unless `docker-build-args` passes it), no lockfile, missing scripts.
+
+### When an image is built
+
+Never just because the push went to the default branch: projects push straight to `main` and CD waits for this CI, so that rule made every deploy wait for image builds. An image is built when one of these changed, and only that image:
+
+- its Dockerfile, its `<Dockerfile>.dockerignore`, or the `.dockerignore` of its build context;
+- a dependency file (`package.json`, `package-lock.json`, `npm-shrinkwrap.json`, `.npmrc`) in the folder its `npm ci` installs from, or that folder's Prisma schema, migrations or `prisma.config`;
+- a file or folder the Dockerfile copies by name (`COPY entrypoint.sh`, `COPY vendor ./vendor`, `COPY ai-runtime/src ./src`);
+- anything in its build context when it copies the whole context (`COPY . .`) and no checks job compiles that code (a Python or Go service, an npm app outside the folders listed above).
+
+Code inside a checked npm app is not a reason: the checks job compiles, lints, tests and builds it on every push, and docker-check covers the Dockerfile. A manual run, a first push or a force-push over a missing commit cannot know what changed, so everything is built. `docker: always` builds every image on every run.
+
+The build context is the Dockerfile's folder, unless its `COPY` sources only exist from a parent folder (a monorepo Dockerfile such as project-fire's `ai-runtime`), in which case the image is built from there, as the servers build it.
 
 ## Use it in a project
 
@@ -28,9 +42,9 @@ Copy [templates/ci.yml](templates/ci.yml) to `.github/workflows/ci.yml` (change 
 
 | Input | Meaning |
 |---|---|
-| `skip` | Comma list of `typecheck, lint, test, build, migrations, docker, audit, secrets` to turn off |
+| `skip` | Comma list of `typecheck, lint, test, build, migrations, docker, docker-check, audit, secrets` to turn off |
 | `node-version` | Default: `.nvmrc`, then `engines.node`, then the Dockerfile's `FROM node:NN`, then 22 |
-| `docker` / `migrations` | `auto` (default), `always`, `never` |
+| `docker` / `migrations` | `auto` (default), `always`, `never`. `docker` covers image builds only; docker-check is turned off with `skip` |
 | `docker-build-args` | Extra Docker build arguments, one `KEY=VALUE` per line, passed to every image build. For build-time values the image needs and the real deploy supplies (typically `NEXT_PUBLIC_*`). Public placeholders only, never secrets: they appear in the build log |
 
 A known gitleaks false positive is allowed with a `.gitleaksignore` or `.gitleaks.toml` in the project (picked up automatically).
@@ -60,7 +74,7 @@ GitHub cannot see a server's memory, so whether a server can take a build is che
 
 ## How a run decides (so the logs are never a mystery)
 
-`detect` compares the pushed range (or the pull request range) to find changed files. If it cannot (first push, force-push over a missing commit, manual run) it assumes everything changed, which only ever runs more, never less. The decision and its reasons are on the run's summary page under "CI plan".
+`detect` compares the pushed range (or the pull request range) to find changed files; the default branch is planned exactly like any other. If it cannot (first push, force-push over a missing commit, manual run) it assumes everything changed, which only ever runs more, never less. The decision and its reasons (which image is built and the file that caused it) are on the run's summary page under "CI plan"; docker-check adds its own section.
 
 ## Releasing a change
 
@@ -81,4 +95,4 @@ Breaking changes get a new major tag (`v2`) and projects move deliberately. Neve
 
 ## Development
 
-`npm test` runs the detector's offline unit tests (`node --test`, no dependencies, builds throwaway git repos as fixtures). `self-test.yml` lints the workflow files with actionlint and runs this repository through its own CI. Lint locally the way the runner does, with shellcheck included (without it, shell problems inside `run:` blocks only show up after the push): `uv tool run --from actionlint-py --with shellcheck-py actionlint`. The audit tests need `jq`, which runners have.
+`npm test` runs the detector's and the Dockerfile check's offline unit tests (`node --test`, no dependencies, builds throwaway git repos as fixtures). `dockerfile-check.mjs` is a port of the seed-plugins `docker/dockerfile_check.py` (the tool agents run locally instead of a Docker build); a rule changed in one must be changed in the other. Locally: `node .github/actions/dockerfile-check/dockerfile-check.mjs --repo-root <project>` (`--no-lockfile` for no network). `self-test.yml` lints the workflow files with actionlint and runs this repository through its own CI. Lint locally the way the runner does, with shellcheck included (without it, shell problems inside `run:` blocks only show up after the push): `uv tool run --from actionlint-py --with shellcheck-py actionlint`. The audit tests need `jq`, which runners have.

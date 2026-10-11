@@ -1,0 +1,16 @@
+name: dockerfile-check
+description: Checks every Dockerfile in the repository without building it (static rules plus the lockfile under the image's npm). Fails on an error finding. No dependencies; needs only Node.
+
+inputs:
+  build-args:
+    description: 'The KEY=VALUE lines the caller passes to its image builds. Only the names are used (an ARG passed here is not reported as empty); values are never printed.'
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      # Through env, never interpolated into the command line: the input is caller text.
+      env:
+        CI_DOCKER_BUILD_ARGS: ${{ inputs.build-args }}
+      run: node "$GITHUB_ACTION_PATH/dockerfile-check.mjs" --repo-root "$GITHUB_WORKSPACE" --github

@@ -6,13 +6,13 @@ inputs:
     description: Force a Node version. Empty means auto-detect (.nvmrc, engines.node, Dockerfile, then 22).
     default: ''
   skip:
-    description: Comma-separated check names to turn off (typecheck, lint, test, build, migrations, docker, audit, secrets).
+    description: Comma-separated check names to turn off (typecheck, lint, test, build, migrations, docker, docker-check, audit, secrets).
     default: ''
   docker:
-    description: auto (only when Docker-relevant files changed or on a default-branch push), always, or never.
+    description: auto (only the images whose inputs changed), always, or never. Applies to image builds, not to docker-check.
     default: auto
   migrations:
-    description: auto (only when prisma/ changed or on a default-branch push), always, or never.
+    description: auto (only when the Prisma schema, migrations or the Prisma app's dependencies changed), always, or never.
     default: auto
 
 outputs:
@@ -21,8 +21,9 @@ outputs:
   node: { description: 'Node version for setup-node', value: '${{ steps.plan.outputs.node }}' }
   run_migrations: { description: '"true" when the migration tier should run', value: '${{ steps.plan.outputs.run_migrations }}' }
   prisma_dir: { description: 'Folder holding prisma/schema.prisma', value: '${{ steps.plan.outputs.prisma_dir }}' }
-  run_docker: { description: '"true" when the Docker tier should run', value: '${{ steps.plan.outputs.run_docker }}' }
-  dockerfiles: { description: 'JSON array, one object per Dockerfile (name, file, context, port, smoke)', value: '${{ steps.plan.outputs.dockerfiles }}' }
+  run_docker_check: { description: '"true" when the Dockerfile check (no build) should run', value: '${{ steps.plan.outputs.run_docker_check }}' }
+  run_docker: { description: '"true" when at least one image should be built', value: '${{ steps.plan.outputs.run_docker }}' }
+  dockerfiles: { description: 'JSON array, one object per image to build (name, file, context, port, smoke)', value: '${{ steps.plan.outputs.dockerfiles }}' }
   run_audit: { description: '"true" when npm audit should run', value: '${{ steps.plan.outputs.run_audit }}' }
   run_secrets: { description: '"true" when the secret scan should run', value: '${{ steps.plan.outputs.run_secrets }}' }
   secrets_range: { description: 'git log range for the secret scan', value: '${{ steps.plan.outputs.secrets_range }}' }
